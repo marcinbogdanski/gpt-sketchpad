@@ -8,3 +8,8 @@ dependencies = [
   "ipykernel==7.1.0",
   "numpy==2.3.4"
 ]
+
+# Don't allow non-wheel installs (no copile from source)
+[tool.uv.pip]
+# Alias for --only-binary :all:
+no-build = true

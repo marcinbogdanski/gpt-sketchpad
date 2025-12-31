@@ -1,21 +1,31 @@
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 import tiktoken
+
+class GPTConfig:
+    def __init__(self, block_size, vocab_size, n_layer, n_head, n_embd, dropout):
+        self.block_size = block_size
+        self.vocab_size = vocab_size
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.n_embd = n_embd
+        self.dropout = dropout
+
+
 
 class CausalSelfAttentionMarcin(nn.Module):
     """Multiple self-attention heads"""
-    def __init__(self, block_size, n_head, n_embd, dropout):
+    def __init__(self, config):
         super().__init__()
-        assert n_embd % n_head == 0
-        self.n_head = n_head
+        assert config.n_embd % config.n_head == 0
+        self.n_head = config.n_head
 
-        self.c_attn = nn.Linear(n_embd, 3*n_embd)
-        self.c_proj = nn.Linear(n_embd, n_embd)
-        self.register_buffer('bias', torch.tril(torch.ones((1, 1, block_size, block_size))))
-        self.drop_1 = nn.Dropout(dropout)
-        self.drop_2 = nn.Dropout(dropout)
+        self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.register_buffer('bias', torch.tril(torch.ones((1, 1, config.block_size, config.block_size))))
+        self.drop = nn.Dropout(config.dropout)
 
     def forward(self, x):
         B, T, C = x.size()
@@ -32,25 +42,24 @@ class CausalSelfAttentionMarcin(nn.Module):
         W_affin = q @ k.mT / H**0.5  # B,nh,T,hs @ B,nh,hs,T -> B,nh,T,T
         W_affin = W_affin.masked_fill(self.bias[:,:,:T,:T]==0, float('-inf'))
         W_affin = torch.softmax(W_affin, dim=-1)  # B,nh,T,T
-        W_affin = self.drop_1(W_affin)
+        W_affin = self.drop(W_affin)
 
         y = W_affin @ v    # B,nh,T,T @ B,nh,T,hs -> B,nh,T,hs
         y = y.transpose(1, 2)  # B,T,nh,hs
         y = y.contiguous()
         y = y.view(B,T,C)
-        y = self.drop_2(y)
 
         out = self.c_proj(y)
         return out
 
-class FeedForward(nn.Module):
+class MLP(nn.Module):
     """Linear transform and activation"""
-    def __init__(self, n_embd, dropout):
+    def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(n_embd, 4*n_embd)
-        self.act = nn.ReLU()
-        self.c_proj = nn.Linear(4*n_embd, n_embd)
-        self.drop = nn.Dropout(dropout)
+        self.c_fc = nn.Linear(config.n_embd, 4*config.n_embd)
+        self.act = nn.GELU(approximate='tanh')
+        self.c_proj = nn.Linear(4*config.n_embd, config.n_embd)
+        self.drop = nn.Dropout(config.dropout)
     
     def forward(self, x):
         x = self.c_fc(x)
@@ -60,15 +69,12 @@ class FeedForward(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, block_size, n_embd, num_heads, dropout):
+    def __init__(self, config):
         super().__init__()
-        
-        self.ln_1 = nn.LayerNorm(n_embd)
-        self.attn = CausalSelfAttentionMarcin(
-            block_size=block_size, n_head=num_heads, n_embd=n_embd, dropout=dropout
-        )
-        self.ln_2 = nn.LayerNorm(n_embd)
-        self.mlp = FeedForward(n_embd, dropout)
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttentionMarcin(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))        # B,T,E pre-norm
@@ -76,16 +82,17 @@ class Block(nn.Module):
         return x
 
 
-class TransformerModel(nn.Module):
-    def __init__(self, block_size, n_vocab, n_embd, num_heads, n_layer, dropout):
+class GPTModel(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.wte = nn.Embedding(n_vocab, n_embd)
-        self.wpe = nn.Embedding(block_size, n_embd)
-        self.h = nn.Sequential(
-            *[Block(block_size=block_size, n_embd=n_embd, num_heads=num_heads, dropout=dropout) for _ in range(n_layer)]            
-        )
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, n_vocab, bias=False)
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embd),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
     def forward(self, idx, targets=None):
         assert idx.dtype == torch.long
@@ -93,11 +100,12 @@ class TransformerModel(nn.Module):
         B, T = idx.shape
         device = idx.device
         
-        tok_emb = self.wte(idx)    #  B,T,E <- B,T
-        pos_emb = self.wpe(torch.arange(T, device=device))    #  B,T,E <- B,T
+        tok_emb = self.transformer.wte(idx)    #  B,T,E <- B,T
+        pos_emb = self.transformer.wpe(torch.arange(T, device=device))    #  B,T,E <- B,T
         x = tok_emb + pos_emb  #  B,T,E
-        x = self.h(x)
-        x = self.ln_f(x)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
         logits = self.lm_head(x)   # B,T,V <- B,T,E
 
         if targets is None:
@@ -178,14 +186,15 @@ def main():
     print(gpt2_logits[0,0,0:10])
 
     # Our Model
-    model = TransformerModel(
+    config = GPTConfig(
         block_size=block_size,
-        n_vocab=n_vocab,
-        n_embd=n_embd,
-        num_heads=num_heads,
+        vocab_size=n_vocab,
         n_layer=num_layer,
-        dropout=dropout
+        n_head=num_heads,
+        n_embd=n_embd,
+        dropout=dropout,
     )
+    model = GPTModel(config)
     model.to(device)
     model.eval()
 
@@ -193,25 +202,24 @@ def main():
     our_sd = model.state_dict()
     our_keys = set(our_sd.keys())
     hf_sd = model_hf.state_dict()
-    hf_keys = set(k.replace('transformer.', '') for k in hf_sd.keys())
+    hf_keys = set(hf_sd.keys())
 
     # Keys in ours but not in HF, and vice versa
     print("Keys in our model not found in HF model:", our_keys - hf_keys)
     print("Keys in HF model not found in our model:", hf_keys - our_keys)
     print('---')
-    for hf_key, hf_val in hf_sd.items():
-        our_key = hf_key.replace('transformer.', '')
-        if our_key not in our_sd:
-            print(f"Skipping key {our_key} not found in our model")
+    for key, hf_val in hf_sd.items():
+        if key not in our_sd:
+            print(f"Skipping key {key} not found in our model")
             continue
         hf_shape = hf_val.shape
-        our_shape = our_sd[our_key].shape
+        our_shape = our_sd[key].shape
         if hf_shape == our_shape:
-            our_sd[our_key] = hf_val.clone()
+            our_sd[key] = hf_val.clone()
         elif hf_shape == (our_shape[1], our_shape[0]):
-            our_sd[our_key] = hf_val.t().clone()
+            our_sd[key] = hf_val.t().clone()
         else:
-            print(f"Shape mismatch for key {our_key}: HF shape {hf_shape}, our shape {our_shape}")
+            print(f"Shape mismatch for key {key}: HF shape {hf_shape}, our shape {our_shape}")
     model.load_state_dict(our_sd)
     print('---')
 

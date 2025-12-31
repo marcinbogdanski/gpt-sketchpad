@@ -1,17 +1,17 @@
-from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import GPT2LMHeadModel
 import tiktoken
 
 class GPTConfig:
-    def __init__(self, block_size, vocab_size, n_layer, n_head, n_embd, dropout):
+    def __init__(self, block_size, vocab_size, n_layer, n_head, n_embd, dropout=0.0):
         self.block_size = block_size
         self.vocab_size = vocab_size
         self.n_layer = n_layer
         self.n_head = n_head
         self.n_embd = n_embd
-        self.dropout = dropout
+        self.dropout = dropout  # 0.0, Karpathy doesn't use dropout in the video
 
 
 
@@ -116,7 +116,46 @@ class GPTModel(nn.Module):
             targets_ = targets.view(B*T)   # B*T
             loss = F.cross_entropy(logits_, targets_)
             return logits, loss
-    
+        
+    @classmethod
+    def from_pretrained(cls, model_name):
+        assert model_name == 'gpt2'  # for now
+        from transformers import GPT2LMHeadModel
+       
+        # HF Model
+        model_hf = GPT2LMHeadModel.from_pretrained('gpt2')
+
+        # Our Model
+        model = GPTModel(GPTConfig(
+            block_size=1024,     # max context length, max len feed into the model,
+            vocab_size=50257,    # 256 original, 50_000 merges, 1 <|end_of_doc|> token,
+            n_layer=12,
+            n_head=12,           # head size 384/6=64,
+            n_embd=768,          # size of embeddings, i.e. 'first layer',
+        ))
+        model.eval()
+
+        # Load weights from HF model
+        our_sd = model.state_dict()
+        our_keys = set(k for k in our_sd.keys() if not k.endswith('.attn.bias'))
+        hf_sd = model_hf.state_dict()
+        hf_keys = set(hf_sd.keys())
+        assert our_keys == hf_keys
+        for key, hf_val in hf_sd.items():
+            hf_shape = hf_val.shape
+            our_shape = our_sd[key].shape
+            transpose = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+            if any(key.endswith(suffix) for suffix in transpose):
+                assert hf_shape[::-1] == our_shape
+                our_sd[key].copy_(hf_val.t().clone())
+            else:
+                assert hf_shape == our_shape
+                our_sd[key].copy_(hf_val.clone())
+
+        return model
+
+
+
     def generate(self, idx, n_seq, max_tokens):
         """Generate max_tokens starting from idx[B,T]"""
         # assert idx.shape == (n_batch, n_seq)
@@ -150,79 +189,32 @@ def main():
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    n_vocab = 50257    # 256 original, 50_000 merges, 1 <|end_of_doc|> token
-    n_batch = 4        # mini-bach, how many in parallel
-    block_size = 1024       # max context length, max len feed into the model
-    n_embd = 768         # size of embeddings, i.e. 'first layer'
-    num_heads = 12     # head size 384/6=64
-    num_layer = 12
-    dropout = 0.0
-
-
+    config = GPTConfig(
+        block_size=1024,     # max context length, max len feed into the model,
+        vocab_size=50257,    # 256 original, 50_000 merges, 1 <|end_of_doc|> token,
+        n_layer=12,
+        n_head=12,           # head size 384/6=64,
+        n_embd=768,          # size of embeddings, i.e. 'first layer',
+    )
+    n_batch = 4
 
     # Random input, long tensor with values in [0, n_vocab)
-    x = torch.randint(0, n_vocab, (n_batch, block_size))
+    x = torch.randint(0, config.vocab_size, (n_batch, config.block_size))
     x = x.to(device)
     
-    
     # HF Model
-    from transformers import GPT2Config, GPT2LMHeadModel
-    config = GPT2Config(
-        vocab_size=n_vocab,
-        n_positions=block_size,
-        n_ctx=block_size,
-        n_embd=n_embd,
-        n_layer=num_layer,
-        n_head=num_heads,
-    )
-    model_hf = GPT2LMHeadModel(config)
+    model_hf = GPT2LMHeadModel.from_pretrained('gpt2')
     model_hf.to(device)
     model_hf.eval()
-
-    # Inference
     gpt2_logits = model_hf(input_ids=x).logits
     print("GPT2 logits shape:", gpt2_logits.shape)   # B,T,C
     print("GPT2 logits dtype:", gpt2_logits.dtype)   # B,T,C
     print(gpt2_logits[0,0,0:10])
 
     # Our Model
-    config = GPTConfig(
-        block_size=block_size,
-        vocab_size=n_vocab,
-        n_layer=num_layer,
-        n_head=num_heads,
-        n_embd=n_embd,
-        dropout=dropout,
-    )
-    model = GPTModel(config)
+    model = GPTModel.from_pretrained('gpt2')
     model.to(device)
     model.eval()
-
-    # Load weights from HF model
-    our_sd = model.state_dict()
-    our_keys = set(our_sd.keys())
-    hf_sd = model_hf.state_dict()
-    hf_keys = set(hf_sd.keys())
-
-    # Keys in ours but not in HF, and vice versa
-    print("Keys in our model not found in HF model:", our_keys - hf_keys)
-    print("Keys in HF model not found in our model:", hf_keys - our_keys)
-    print('---')
-    for key, hf_val in hf_sd.items():
-        if key not in our_sd:
-            print(f"Skipping key {key} not found in our model")
-            continue
-        hf_shape = hf_val.shape
-        our_shape = our_sd[key].shape
-        if hf_shape == our_shape:
-            our_sd[key] = hf_val.clone()
-        elif hf_shape == (our_shape[1], our_shape[0]):
-            our_sd[key] = hf_val.t().clone()
-        else:
-            print(f"Shape mismatch for key {key}: HF shape {hf_shape}, our shape {our_shape}")
-    model.load_state_dict(our_sd)
-    print('---')
-
     logits, loss = model(x)
     print("logits shape:", logits[0].shape)   # B,T,C
     print("logits dtype:", logits[0].dtype)   # B,T,C

@@ -85,6 +85,7 @@ class Block(nn.Module):
 class GPTModel(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -95,14 +96,16 @@ class GPTModel(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
     def forward(self, idx, targets=None):
-        assert idx.dtype == torch.long
-        assert targets is None or targets.dtype == torch.long
         B, T = idx.shape
-        device = idx.device
+        assert T <= self.config.block_size
         
-        tok_emb = self.transformer.wte(idx)    #  B,T,E <- B,T
-        pos_emb = self.transformer.wpe(torch.arange(T, device=device))    #  B,T,E <- B,T
-        x = tok_emb + pos_emb  #  B,T,E
+        # Embeddings
+        pos = torch.arange(T, device=idx.device)  # T
+        pos_emb = self.transformer.wpe(pos)       #   T,E <- T
+        tok_emb = self.transformer.wte(idx)       # B,T,E <- B,T
+        x = tok_emb + pos_emb                     # B,T,E
+
+        # Transformer
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -154,39 +157,28 @@ class GPTModel(nn.Module):
 
         return model
 
+def generate(model, idx, max_new_tokens, top_k=50):
+    """Generate max_tokens starting from idx[B,T]"""
+    assert isinstance(idx, torch.Tensor)
+    assert idx.dtype == torch.long
+    assert len(idx.shape) == 2  # B,T
+    assert isinstance(max_new_tokens, int)
+    
+    model.eval()
+    block_size = model.config.block_size
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            idx_tail = idx[:, -block_size:]    # B,T  sliding window
+            logits, _ = model(idx_tail)         # B,T,C <- B,T
+            logits = logits[:, -1, :]          # B,C <- B,T,C  discard all but last
+            probs = F.softmax(logits, dim=-1)  # B,C
+            topk_probs, topk_indices = torch.topk(probs, k=top_k, dim=-1)  # B,k
+            ix = torch.multinomial(topk_probs, num_samples=1)  # B,1
+            xcol = torch.gather(topk_indices, -1, ix)          # B,1
+            idx = torch.cat((idx, xcol), dim=1)                # B,T+1  append
+    return idx
 
-
-    def generate(self, idx, n_seq, max_tokens):
-        """Generate max_tokens starting from idx[B,T]"""
-        # assert idx.shape == (n_batch, n_seq)
-        assert idx.dtype == torch.long
-        assert isinstance(max_tokens, int)
-
-        for _ in range(max_tokens):
-
-            # Sliding window over idx
-            idx_tail = idx[:, -n_seq:]
-
-            # Model Output
-            logits, _ = self(idx_tail)      # B,T,C <- B,T
-
-            # Discard all but last step
-            logits = logits[:, -1, :]  # B,C <- B,T,C
-
-            probs = F.softmax(logits, dim=-1)  # (B, C)
-
-            idx_next = torch.multinomial(probs, num_samples=1)  # B, 1
-
-            idx = torch.cat((idx, idx_next), dim=1)  # B, T+1
-
-        return idx
-
-
-
-
-@torch.no_grad()
-def main():
-
+def test_logits():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     config = GPTConfig(
@@ -197,28 +189,77 @@ def main():
         n_embd=768,          # size of embeddings, i.e. 'first layer',
     )
     n_batch = 4
-
-    # Random input, long tensor with values in [0, n_vocab)
-    x = torch.randint(0, config.vocab_size, (n_batch, config.block_size))
-    x = x.to(device)
-    
+   
     # HF Model
     model_hf = GPT2LMHeadModel.from_pretrained('gpt2')
     model_hf.to(device)
     model_hf.eval()
-    gpt2_logits = model_hf(input_ids=x).logits
-    print("GPT2 logits shape:", gpt2_logits.shape)   # B,T,C
-    print("GPT2 logits dtype:", gpt2_logits.dtype)   # B,T,C
-    print(gpt2_logits[0,0,0:10])
 
     # Our Model
     model = GPTModel.from_pretrained('gpt2')
     model.to(device)
     model.eval()
-    logits, loss = model(x)
-    print("logits shape:", logits[0].shape)   # B,T,C
-    print("logits dtype:", logits[0].dtype)   # B,T,C
-    print(logits[0,0,0:10])
+    
+    # Reproducibility
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    # Random Input
+    x = torch.randint(0, config.vocab_size, (n_batch, config.block_size))
+    x = x.to(device)
+
+    with torch.no_grad():
+        # Compare outputs
+        logits_hf = model_hf(input_ids=x).logits
+        print("GPT2 logits shape:", logits_hf.shape)   # B,T,C
+        print("GPT2 logits dtype:", logits_hf.dtype)   # B,T,C
+        print(logits_hf[0,0,0:10].tolist())
+
+        logits, _ = model(x)
+        print("logits shape:", logits.shape)   # B,T,C
+        print("logits dtype:", logits.dtype)   # B,T,C
+        print(logits[0,0,0:10].tolist())
+
+        all_close = torch.allclose(logits, logits_hf, atol=1e-5)
+        print("All close:", all_close)
+        assert all_close
+    
+def test_generate():    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # Model
+    model = GPTModel.from_pretrained('gpt2')
+    model.to(device)
+    model.eval()
+
+    # Tokenizer
+    tokenizer = tiktoken.get_encoding("gpt2")
+
+    # Input
+    prompt = "Hello, I'm a language model,"
+    num_sequences = 5
+    max_new_tokens=20
+    tokens = tokenizer.encode(prompt)
+    tokens = torch.tensor(tokens, dtype=torch.long, device=device)  # T
+    tokens = tokens.unsqueeze(0).repeat(num_sequences, 1)  # B,T
+    
+    # Reproducibility
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    # Generation
+    generated_ids = generate(model, tokens, max_new_tokens=max_new_tokens)
+    for i in range(generated_ids.shape[0]):
+        generated_text = tokenizer.decode(generated_ids[i].tolist())
+        print(f"{i}:", generated_text)
+    # 0:  Hello, I'm a language model, not a program.\n\nSo this morning I started studying for the interview in the lab. This
+    # 1:  Hello, I'm a language model, and one of the main things that bothers me when they create languages is how easy it becomes to create
+    # 2:  Hello, I'm a language model, and I wrote it off on the grounds that a language model would make me more fluent. But I
+    # 3:  Hello, I'm a language model, I really like languages. I like languages because like, they're good. And the way we talk
+    # 4:  Hello, I'm a language model, a language model I'm using for data modelling. All I did was test the results and then I
+
 
 if __name__ == "__main__":
-    main()
+    # test_logits()
+    test_generate()
+

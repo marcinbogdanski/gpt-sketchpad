@@ -25,6 +25,7 @@ class CausalSelfAttentionMarcin(nn.Module):
 
         self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1  # flag to scale proj into residual
         self.register_buffer('bias', torch.tril(torch.ones((1, 1, config.block_size, config.block_size))))
         self.drop = nn.Dropout(config.dropout)
 
@@ -60,6 +61,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4*config.n_embd)
         self.act = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4*config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1  # flag to scale proj into residual
         self.drop = nn.Dropout(config.dropout)
     
     def forward(self, x):
@@ -98,6 +100,25 @@ class GPTModel(nn.Module):
 
         # Weight Sharing
         self.transformer.wte.weight = self.lm_head.weight
+
+        # Init Params
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        # note: wte/lm_head initialized twice, but that's ok
+        if isinstance(module, nn.Linear):
+            # 0.02 based on openai tensorflow source
+            # 1/sqrt(768) = 0.036, 0.02 is "roughly reasonable"
+            std = 0.02
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                # each block project to residual 2x times: attention and MLP
+                num_layers = 2 * self.config.n_layer
+                std *= num_layers**-0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape

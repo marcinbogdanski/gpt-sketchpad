@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -185,7 +186,7 @@ def test_logits():
         block_size=1024,     # max context length, max len feed into the model,
         vocab_size=50257,    # 256 original, 50_000 merges, 1 <|end_of_doc|> token,
         n_layer=12,
-        n_head=12,           # head size 384/6=64,
+        n_head=12,           # head size 768/12=64,
         n_embd=768,          # size of embeddings, i.e. 'first layer',
     )
     n_batch = 4
@@ -258,8 +259,76 @@ def test_generate():
     # 3:  Hello, I'm a language model, I really like languages. I like languages because like, they're good. And the way we talk
     # 4:  Hello, I'm a language model, a language model I'm using for data modelling. All I did was test the results and then I
 
+class DataLoader:
+    def __init__(self, data_path, batch_size, block_size):
+        self.data_path = data_path
+        self.batch_size = batch_size
+        self.block_size = block_size
+        self.pos = 0
+
+        with open(data_path, 'r') as f:
+            text = f.read()
+        tokenizer = tiktoken.get_encoding("gpt2")
+        tokens = tokenizer.encode(text)
+        self.tokens = torch.tensor(tokens)
+
+    def get_batch(self):
+        p, T, B = self.pos, self.block_size, self.batch_size
+        
+        buff = self.tokens[p:p+B*T+1]
+        x = buff[:-1].view(B, T)
+        y = buff[1:].view(B, T)
+
+        self.pos += B*T
+        if self.pos+B*T+1 > len(self.tokens):
+            self.pos = 0
+
+        return x, y
+
+def test_overfit():
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # Model
+    model = GPTModel(GPTConfig(
+        block_size=1024,     # max context length, max len feed into the model,
+        vocab_size=50257,    # 256 original, 50_000 merges, 1 <|end_of_doc|> token,
+        n_layer=12,
+        n_head=12,           # head size 768/12=64,
+        n_embd=768,          # size of embeddings, i.e. 'first layer',
+    ))
+    model.to(device)
+    model.eval()
+
+    # Reproducibility
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    B = 4
+    T = 32
+    i = 0
+
+    data_path = os.path.dirname(__file__)+'/../data/tinyshakespeare.txt'
+    data_loader = DataLoader(data_path, batch_size=B, block_size=T)
+
+    model.train()
+    for i in range(50):
+        x, y = data_loader.get_batch()
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        print(i, loss.item())
+    
+
+    print("Bye")
+
 
 if __name__ == "__main__":
     # test_logits()
-    test_generate()
+    # test_generate()
+    test_overfit()
 

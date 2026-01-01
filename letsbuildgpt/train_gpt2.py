@@ -249,6 +249,11 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed(42)
 
+    # torch.set_float32_matmul_precision("high")        # in video
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'  # newer api
+    torch.backends.cudnn.conv.fp32_precision = 'tf32'
+
+
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
@@ -263,7 +268,9 @@ def main():
         x, y = data_loader.get_batch()
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
-        logits, loss = model(x, y)
+        # https://docs.pytorch.org/tutorials/recipes/recipes/amp_recipe.html
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
         loss.backward()
         optimizer.step()
         torch.cuda.synchronize()
@@ -275,6 +282,8 @@ def main():
     print(f"Avg dt: {sum(dt_list)/len(dt_list)*1e3:.2f}  Agv tps: {sum(tps_list)/len(tps_list):.2f}")
 
     # Avg dt: 534.84  Agv tps: 15364.54 - base fp32
+    # Avg dt: 405.77  Agv tps: 20282.09 - use tf32
+    # Avg dt: 303.13  Agv tps: 27361.53 - add autocast to bf16 in fwd/loss calc
 
     print("Bye")
 

@@ -255,7 +255,7 @@ def main():
     torch.backends.cudnn.conv.fp32_precision = 'tf32'
 
     # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 
     # Data Loader
     data_path = os.path.dirname(__file__)+'/../data/tinyshakespeare.txt'
@@ -272,13 +272,14 @@ def main():
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         torch.cuda.synchronize()
         dt = (time.time() - ts)
         tps = (data_loader.batch_size*data_loader.block_size) / dt
         if i != 0:  # skip compile
             dt_list.append(dt), tps_list.append(tps)
-        print(f"{i}:, L={loss.item():.6f}, t={dt*1e3:.2f}s, tps={tps:.2f}")
+        print(f"{i}:, L={loss.item():.6f}, n={norm:.4f}, dt={dt*1e3:.2f}s, tps={tps:.2f}")
     
     print(f"Avg dt: {sum(dt_list)/len(dt_list)*1e3:.2f}  Agv tps: {sum(tps_list)/len(tps_list):.2f}")
 

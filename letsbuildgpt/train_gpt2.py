@@ -242,7 +242,7 @@ def main():
         n_embd=768,          # size of embeddings, i.e. 'first layer',
     ))
     model.to(device)
-    model.eval()
+    model = torch.compile(model)
 
     # Reproducibility
     torch.manual_seed(42)
@@ -276,7 +276,8 @@ def main():
         torch.cuda.synchronize()
         dt = (time.time() - ts)
         tps = (data_loader.batch_size*data_loader.block_size) / dt
-        dt_list.append(dt), tps_list.append(tps)
+        if i != 0:  # skip compile
+            dt_list.append(dt), tps_list.append(tps)
         print(f"{i}:, L={loss.item():.6f}, t={dt*1e3:.2f}s, tps={tps:.2f}")
     
     print(f"Avg dt: {sum(dt_list)/len(dt_list)*1e3:.2f}  Agv tps: {sum(tps_list)/len(tps_list):.2f}")
@@ -284,6 +285,7 @@ def main():
     # Avg dt: 534.84  Agv tps: 15364.54 - base fp32
     # Avg dt: 405.77  Agv tps: 20282.09 - use tf32
     # Avg dt: 303.13  Agv tps: 27361.53 - add autocast to bf16 in fwd/loss calc
+    # Avg dt: 183.24  Agv tps: 44706.74 - add torch.compile()
 
     print("Bye")
 

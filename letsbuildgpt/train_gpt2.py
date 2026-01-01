@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -203,86 +204,6 @@ def generate(model, idx, max_new_tokens, top_k=50):
             idx = torch.cat((idx, xcol), dim=1)                # B,T+1  append
     return idx
 
-def test_logits():
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    config = GPTConfig(
-        block_size=1024,     # max context length, max len feed into the model,
-        vocab_size=50257,    # 256 original, 50_000 merges, 1 <|end_of_doc|> token,
-        n_layer=12,
-        n_head=12,           # head size 768/12=64,
-        n_embd=768,          # size of embeddings, i.e. 'first layer',
-    )
-    n_batch = 4
-   
-    # HF Model
-    model_hf = GPT2LMHeadModel.from_pretrained('gpt2')
-    model_hf.to(device)
-    model_hf.eval()
-
-    # Our Model
-    model = GPTModel.from_pretrained('gpt2')
-    model.to(device)
-    model.eval()
-    
-    # Reproducibility
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-
-    # Random Input
-    x = torch.randint(0, config.vocab_size, (n_batch, config.block_size))
-    x = x.to(device)
-
-    with torch.no_grad():
-        # Compare outputs
-        logits_hf = model_hf(input_ids=x).logits
-        print("GPT2 logits shape:", logits_hf.shape)   # B,T,C
-        print("GPT2 logits dtype:", logits_hf.dtype)   # B,T,C
-        print(logits_hf[0,0,0:10].tolist())
-
-        logits, _ = model(x)
-        print("logits shape:", logits.shape)   # B,T,C
-        print("logits dtype:", logits.dtype)   # B,T,C
-        print(logits[0,0,0:10].tolist())
-
-        all_close = torch.allclose(logits, logits_hf, atol=1e-5)
-        print("All close:", all_close)
-        assert all_close
-    
-def test_generate():    
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # Model
-    model = GPTModel.from_pretrained('gpt2')
-    model.to(device)
-    model.eval()
-
-    # Tokenizer
-    tokenizer = tiktoken.get_encoding("gpt2")
-
-    # Input
-    prompt = "Hello, I'm a language model,"
-    num_sequences = 5
-    max_new_tokens=20
-    tokens = tokenizer.encode(prompt)
-    tokens = torch.tensor(tokens, dtype=torch.long, device=device)  # T
-    tokens = tokens.unsqueeze(0).repeat(num_sequences, 1)  # B,T
-    
-    # Reproducibility
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-
-    # Generation
-    generated_ids = generate(model, tokens, max_new_tokens=max_new_tokens)
-    for i in range(generated_ids.shape[0]):
-        generated_text = tokenizer.decode(generated_ids[i].tolist())
-        print(f"{i}:", generated_text)
-    # 0:  Hello, I'm a language model, not a program.\n\nSo this morning I started studying for the interview in the lab. This
-    # 1:  Hello, I'm a language model, and one of the main things that bothers me when they create languages is how easy it becomes to create
-    # 2:  Hello, I'm a language model, and I wrote it off on the grounds that a language model would make me more fluent. But I
-    # 3:  Hello, I'm a language model, I really like languages. I like languages because like, they're good. And the way we talk
-    # 4:  Hello, I'm a language model, a language model I'm using for data modelling. All I did was test the results and then I
-
 class DataLoader:
     def __init__(self, data_path, batch_size, block_size):
         self.data_path = data_path
@@ -309,7 +230,7 @@ class DataLoader:
 
         return x, y
 
-def test_overfit():
+def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # Model
@@ -325,34 +246,39 @@ def test_overfit():
 
     # Reproducibility
     torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-    B = 4
-    T = 32
-    i = 0
-
+    # Data Loader
     data_path = os.path.dirname(__file__)+'/../data/tinyshakespeare.txt'
-    data_loader = DataLoader(data_path, batch_size=B, block_size=T)
+    data_loader = DataLoader(data_path, batch_size=8, block_size=1024)
 
+    dt_list, tps_list = [], []
     model.train()
     for i in range(50):
+        ts = time.time()
         x, y = data_loader.get_batch()
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
         logits, loss = model(x, y)
         loss.backward()
         optimizer.step()
-        print(i, loss.item())
+        torch.cuda.synchronize()
+        dt = (time.time() - ts)
+        tps = (data_loader.batch_size*data_loader.block_size) / dt
+        dt_list.append(dt), tps_list.append(tps)
+        print(f"{i}:, L={loss.item():.6f}, t={dt*1e3:.2f}s, tps={tps:.2f}")
     
+    print(f"Avg dt: {sum(dt_list)/len(dt_list)*1e3:.2f}  Agv tps: {sum(tps_list)/len(tps_list):.2f}")
+
+    # Avg dt: 534.84  Agv tps: 15364.54 - base fp32
 
     print("Bye")
 
 
 if __name__ == "__main__":
-    # test_logits()
-    # test_generate()
-    test_overfit()
+    main()
 

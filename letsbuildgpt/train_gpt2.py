@@ -242,7 +242,7 @@ def main():
     # Model
     model = GPTModel(GPTConfig(
         block_size=1024,     # max context length, max len feed into the model,
-        vocab_size=50257,    # 256 original, 50_000 merges, 1 <|end_of_doc|> token,
+        vocab_size=50304,    # 50304 is 'nicer', original was 50257
         n_layer=12,
         n_head=12,           # head size 768/12=64,
         n_embd=768,          # size of embeddings, i.e. 'first layer',
@@ -287,6 +287,7 @@ def main():
     # Avg dt: 303.13  Agv tps: 27361.53 - add autocast to bf16 in fwd/loss calc
     # Avg dt: 183.24  Agv tps: 44706.74 - add torch.compile()
     # Avg dt: 139.38  Agv tps: 58773.61 - fused flash attention
+    # Avg dt: 136.42  Agv tps: 60050.99 - switch vocab size to 50304
 
     print("Bye")
 

@@ -1,4 +1,5 @@
 import os
+import math
 import time
 import torch
 import torch.nn as nn
@@ -231,6 +232,22 @@ class DataLoader:
 
         return x, y
 
+class LRScheduler:
+    def __init__(self, max_lr, min_lr, warmup_steps, max_steps):
+        self.max_lr = max_lr
+        self.min_lr = min_lr
+        self.warmup_steps = warmup_steps
+        self.max_steps = max_steps
+    def get_lr(self, step):
+        if step < self.warmup_steps:
+            return self.max_lr * (step+1) / self.warmup_steps
+        elif self.warmup_steps <= step < self.max_steps:
+            decay_ratio = (step-self.warmup_steps) / (self.max_steps-self.warmup_steps)
+            cf = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+            return self.min_lr + cf * (self.max_lr - self.min_lr)
+        else:
+            return self.min_lr
+
 def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -261,9 +278,16 @@ def main():
     data_path = os.path.dirname(__file__)+'/../data/tinyshakespeare.txt'
     data_loader = DataLoader(data_path, batch_size=8, block_size=1024)
 
+    # LR Scheduler
+    max_lr = 6e-4
+    min_lr = max_lr * 0.1
+    warmup_steps = 10
+    max_steps = 50
+    lr_scheduler = LRScheduler(max_lr, min_lr, warmup_steps=warmup_steps, max_steps=max_steps)
+
     dt_list, tps_list = [], []
     model.train()
-    for i in range(50):
+    for i in range(max_steps):
         ts = time.time()
         x, y = data_loader.get_batch()
         x, y = x.to(device), y.to(device)
@@ -273,13 +297,16 @@ def main():
             logits, loss = model(x, y)
         loss.backward()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        lr = lr_scheduler.get_lr(i)
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr
         optimizer.step()
         torch.cuda.synchronize()
         dt = (time.time() - ts)
         tps = (data_loader.batch_size*data_loader.block_size) / dt
         if i != 0:  # skip compile
             dt_list.append(dt), tps_list.append(tps)
-        print(f"{i}:, L={loss.item():.6f}, n={norm:.4f}, dt={dt*1e3:.2f}s, tps={tps:.2f}")
+        print(f"{i:4d}:, L={loss.item():.6f}, lr={lr:.4e} norm={norm:.4f}, dt={dt*1e3:.2f}s, tps={tps:.2f}")
     
     print(f"Avg dt: {sum(dt_list)/len(dt_list)*1e3:.2f}  Agv tps: {sum(tps_list)/len(tps_list):.2f}")
 

@@ -28,7 +28,7 @@ class CausalSelfAttentionMarcin(nn.Module):
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1  # flag to scale proj into residual
         self.register_buffer('bias', torch.tril(torch.ones((1, 1, config.block_size, config.block_size))))
-        self.drop = nn.Dropout(config.dropout)
+        # self.drop = nn.Dropout(config.dropout)
 
     def forward(self, x):
         B, T, C = x.size()
@@ -41,13 +41,14 @@ class CausalSelfAttentionMarcin(nn.Module):
         k = k.transpose(1, 2)  # B,nh,T,hs
         v = v.transpose(1, 2)  # B,nh,T,hs
 
-        H = k.shape[-1]
-        W_affin = q @ k.mT / H**0.5  # B,nh,T,hs @ B,nh,hs,T -> B,nh,T,T
-        W_affin = W_affin.masked_fill(self.bias[:,:,:T,:T]==0, float('-inf'))
-        W_affin = torch.softmax(W_affin, dim=-1)  # B,nh,T,T
-        W_affin = self.drop(W_affin)
+        # H = k.shape[-1]
+        # W_affin = q @ k.mT / H**0.5  # B,nh,T,hs @ B,nh,hs,T -> B,nh,T,T
+        # W_affin = W_affin.masked_fill(self.bias[:,:,:T,:T]==0, float('-inf'))
+        # W_affin = torch.softmax(W_affin, dim=-1)  # B,nh,T,T
+        # W_affin = self.drop(W_affin)
+        # y = W_affin @ v    # B,nh,T,T @ B,nh,T,hs -> B,nh,T,hs
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
-        y = W_affin @ v    # B,nh,T,T @ B,nh,T,hs -> B,nh,T,hs
         y = y.transpose(1, 2)  # B,T,nh,hs
         y = y.contiguous()
         y = y.view(B,T,C)
@@ -233,6 +234,11 @@ class DataLoader:
 def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+    # Reproducibility
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
+
     # Model
     model = GPTModel(GPTConfig(
         block_size=1024,     # max context length, max len feed into the model,
@@ -244,15 +250,9 @@ def main():
     model.to(device)
     model = torch.compile(model)
 
-    # Reproducibility
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
-
     # torch.set_float32_matmul_precision("high")        # in video
     torch.backends.cuda.matmul.fp32_precision = 'tf32'  # newer api
     torch.backends.cudnn.conv.fp32_precision = 'tf32'
-
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
@@ -286,6 +286,7 @@ def main():
     # Avg dt: 405.77  Agv tps: 20282.09 - use tf32
     # Avg dt: 303.13  Agv tps: 27361.53 - add autocast to bf16 in fwd/loss calc
     # Avg dt: 183.24  Agv tps: 44706.74 - add torch.compile()
+    # Avg dt: 139.38  Agv tps: 58773.61 - fused flash attention
 
     print("Bye")
 

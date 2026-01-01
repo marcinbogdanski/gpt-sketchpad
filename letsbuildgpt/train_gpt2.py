@@ -1,6 +1,7 @@
 import os
 import math
 import time
+import inspect
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -271,9 +272,6 @@ def main():
     torch.backends.cuda.matmul.fp32_precision = 'tf32'  # newer api
     torch.backends.cudnn.conv.fp32_precision = 'tf32'
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-
     # Data Loader
     data_path = os.path.dirname(__file__)+'/../data/tinyshakespeare.txt'
     data_loader = DataLoader(data_path, batch_size=8, block_size=1024)
@@ -284,6 +282,34 @@ def main():
     warmup_steps = 10
     max_steps = 50
     lr_scheduler = LRScheduler(max_lr, min_lr, warmup_steps=warmup_steps, max_steps=max_steps)
+
+    # Optimizer
+    weight_decay = 0.1
+    # All params that require grad
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+    # weight decay 2D params (matmul, embd), skip 1D (biases, layernorms)
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': nodecay_params, 'weight_decay': 0.0}
+    ]
+    num_decay = sum(p.numel() for p in decay_params)
+    num_nodecay = sum(p.numel() for p in nodecay_params)
+    print(f"Decay {len(decay_params)} tensors with {num_decay} params")
+    print(f"Nodecay {len(nodecay_params)} tensors with {num_nodecay} params")
+    # Check if fused adam
+    fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+    use_fused = fused_available and 'cuda' in device
+    print(f"Using fused AdamW: {use_fused}")
+    optimizer = torch.optim.AdamW(
+        optim_groups,
+        lr=max_lr,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        fused=use_fused,
+    )
 
     dt_list, tps_list = [], []
     model.train()
@@ -316,6 +342,7 @@ def main():
     # Avg dt: 183.24  Agv tps: 44706.74 - add torch.compile()
     # Avg dt: 139.38  Agv tps: 58773.61 - fused flash attention
     # Avg dt: 136.42  Agv tps: 60050.99 - switch vocab size to 50304
+    # Avg dt: 134.80  Agv tps: 60773.48 - fused AdamW
 
     print("Bye")
 

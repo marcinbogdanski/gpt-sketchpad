@@ -269,12 +269,20 @@ def main():
     model = torch.compile(model)
 
     # torch.set_float32_matmul_precision("high")        # in video
-    torch.backends.cuda.matmul.fp32_precision = 'tf32'  # newer api
-    torch.backends.cudnn.conv.fp32_precision = 'tf32'
+    # torch.backends.cuda.matmul.fp32_precision = 'tf32'  # newer api
+    # torch.backends.cudnn.conv.fp32_precision = 'tf32'
+
+    # Batching
+    total_batch_size = 524288   # 2**19, ~0.5M
+    block_size = 1024
+    micro_batch = 8
+    assert total_batch_size % (block_size*micro_batch) == 0  # divisible into grad_accum
+    grad_accum = total_batch_size // (block_size*micro_batch)
+    print(f"{total_batch_size=}, {block_size=}, {micro_batch=}, {grad_accum=}")
 
     # Data Loader
     data_path = os.path.dirname(__file__)+'/../data/tinyshakespeare.txt'
-    data_loader = DataLoader(data_path, batch_size=8, block_size=1024)
+    data_loader = DataLoader(data_path, batch_size=micro_batch, block_size=block_size)
 
     # LR Scheduler
     max_lr = 6e-4
@@ -315,24 +323,34 @@ def main():
     model.train()
     for i in range(max_steps):
         ts = time.time()
-        x, y = data_loader.get_batch()
-        x, y = x.to(device), y.to(device)
+
+        # Calc gradient
+        loss_accum = 0.0
         optimizer.zero_grad()
-        # https://docs.pytorch.org/tutorials/recipes/recipes/amp_recipe.html
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        loss.backward()
+        for ii in range(grad_accum):
+            x, y = data_loader.get_batch()
+            x, y = x.to(device), y.to(device)
+            # https://docs.pytorch.org/tutorials/recipes/recipes/amp_recipe.html
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+            loss /= grad_accum
+            loss.backward()
+            loss_accum += loss.detach()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        # Optimizer step
         lr = lr_scheduler.get_lr(i)
         for pg in optimizer.param_groups:
             pg['lr'] = lr
         optimizer.step()
+
+        # Logs
         torch.cuda.synchronize()
         dt = (time.time() - ts)
-        tps = (data_loader.batch_size*data_loader.block_size) / dt
+        tps = (micro_batch * block_size * grad_accum) / dt
         if i != 0:  # skip compile
             dt_list.append(dt), tps_list.append(tps)
-        print(f"{i:4d}:, L={loss.item():.6f}, lr={lr:.4e} norm={norm:.4f}, dt={dt*1e3:.2f}s, tps={tps:.2f}")
+        print(f"{i:4d}:, L={loss_accum.item():.6f}, lr={lr:.4e} norm={norm:.4f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
     
     print(f"Avg dt: {sum(dt_list)/len(dt_list)*1e3:.2f}  Agv tps: {sum(tps_list)/len(tps_list):.2f}")
 

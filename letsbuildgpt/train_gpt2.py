@@ -2,10 +2,11 @@ import os
 import math
 import time
 import inspect
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import GPT2LMHeadModel
+from torch.nn.parallel import DistributedDataParallel as DDP
 import tiktoken
 
 class GPTConfig:
@@ -29,8 +30,7 @@ class CausalSelfAttentionMarcin(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1  # flag to scale proj into residual
-        self.register_buffer('bias', torch.tril(torch.ones((1, 1, config.block_size, config.block_size))))
-        # self.drop = nn.Dropout(config.dropout)
+        # self.register_buffer('bias', torch.tril(torch.ones((1, 1, config.block_size, config.block_size))))
 
     def forward(self, x):
         B, T, C = x.size()
@@ -43,11 +43,9 @@ class CausalSelfAttentionMarcin(nn.Module):
         k = k.transpose(1, 2)  # B,nh,T,hs
         v = v.transpose(1, 2)  # B,nh,T,hs
 
-        # H = k.shape[-1]
-        # W_affin = q @ k.mT / H**0.5  # B,nh,T,hs @ B,nh,hs,T -> B,nh,T,T
+        # W_affin = q @ k.mT / k.shape[-1]**0.5  # B,nh,T,hs @ B,nh,hs,T -> B,nh,T,T
         # W_affin = W_affin.masked_fill(self.bias[:,:,:T,:T]==0, float('-inf'))
         # W_affin = torch.softmax(W_affin, dim=-1)  # B,nh,T,T
-        # W_affin = self.drop(W_affin)
         # y = W_affin @ v    # B,nh,T,T @ B,nh,T,hs -> B,nh,T,hs
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
@@ -66,13 +64,13 @@ class MLP(nn.Module):
         self.act = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4*config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1  # flag to scale proj into residual
-        self.drop = nn.Dropout(config.dropout)
+        # self.drop = nn.Dropout(config.dropout)
     
     def forward(self, x):
         x = self.c_fc(x)
         x = self.act(x)
         x = self.c_proj(x)
-        x = self.drop(x)
+        # x = self.drop(x)
         return x
 
 class Block(nn.Module):
@@ -208,11 +206,13 @@ def generate(model, idx, max_new_tokens, top_k=50):
     return idx
 
 class DataLoader:
-    def __init__(self, data_path, batch_size, block_size):
+    def __init__(self, data_path, batch_size, block_size, proc_rank, world_size):
         self.data_path = data_path
         self.batch_size = batch_size
         self.block_size = block_size
-        self.pos = 0
+        self.proc_rank = proc_rank
+        self.world_size = world_size
+        self.pos = self.batch_size * self.block_size * self.proc_rank
 
         with open(data_path, 'r') as f:
             text = f.read()
@@ -221,15 +221,24 @@ class DataLoader:
         self.tokens = torch.tensor(tokens)
 
     def get_batch(self):
-        p, T, B = self.pos, self.block_size, self.batch_size
-        
-        buff = self.tokens[p:p+B*T+1]
-        x = buff[:-1].view(B, T)
-        y = buff[1:].view(B, T)
+        buff = self.tokens[self.pos:self.pos+self.batch_size*self.block_size+1]
+        x = buff[:-1].view(self.batch_size, self.block_size)
+        y = buff[1:].view(self.batch_size, self.block_size)
 
-        self.pos += B*T
-        if self.pos+B*T+1 > len(self.tokens):
-            self.pos = 0
+        # TODO: needs per-epoch shuffling deterministic across DDP
+        # TODO: Position reset logic is subject to slightly different behavior between:
+        # - no DDP, large batch with gradient accumlation - boundry checked every mini_batch
+        # - DDP, large batch spread across GPUs, no grad accum - boundry checked every full batch
+        self.pos += self.batch_size * self.block_size * self.world_size
+        if self.pos + self.batch_size * self.block_size * self.world_size + 1 > len(self.tokens):
+            # will need later to update DataLoader
+            # for r in range(self.world_size):
+            #     if self.proc_rank == r:
+            #         print(f"{self.proc_rank}: RESET POS at: {self.pos}", flush=True)
+            #     if self.world_size != 1:
+            #         torch.distributed.barrier()
+            # print(f"RESET ({self.proc_rank}): {self.pos}")
+            self.pos = self.batch_size * self.block_size * self.proc_rank
 
         return x, y
 
@@ -250,12 +259,63 @@ class LRScheduler:
             return self.min_lr
 
 def main():
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # DDP Init
+    ddp = int(os.environ.get('RANK', -1)) != -1  # is this ddp run?
+    if ddp:
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        ddp_master = ddp_rank == 0  # is this a master?
+        device = f'cuda:{ddp_local_rank}'
+        device_type = 'cuda'
+        assert torch.cuda.is_available()
+        torch.cuda.set_device(device)
+        torch.distributed.init_process_group(backend='nccl', device_id=ddp_local_rank)  # device_id= to suppress barrier warning
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        ddp_master = True
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device_type = device
+    print(f"{ddp=} {ddp_rank=}, {ddp_local_rank=}, {ddp_world_size=}, {ddp_master=}, {device=}")
+
+    # Note = 'tf32' is the correct way as per torch 2.9 docs
+    # torch.set_float32_matmul_precision("high")        # in video, causes deprecated warning
+    assert torch.backends.cuda.matmul.fp32_precision    # check they exist
+    assert torch.backends.cudnn.conv.fp32_precision
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'  # newer api
+    torch.backends.cudnn.conv.fp32_precision = 'tf32'
 
     # Reproducibility
+    # TODO: Model init relies on identical random seeds, will address later
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(42)
+        torch.cuda.manual_seed_all(42)
+    
+    ################################ EQUIVALENCE ###############################
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
+    # torch.use_deterministic_algorithms(True)
+    ############################################################################
+
+    # Batching
+    total_batch_size = 524288   # 2**19, ~0.5M
+    micro_batch = 16             # what fits in GPU
+    block_size = 1024
+    assert total_batch_size % (block_size*micro_batch*ddp_world_size) == 0
+    grad_accum = total_batch_size // (block_size*micro_batch*ddp_world_size)
+    if ddp_master:
+        print(f"{total_batch_size=}, {block_size=}, {micro_batch=}, {ddp_world_size=}, {grad_accum=}")
+
+    # Data Loader
+    data_loader = DataLoader(
+        data_path=os.path.dirname(__file__)+'/../data/tinyshakespeare.txt',
+        batch_size=micro_batch,
+        block_size=block_size,
+        proc_rank=ddp_rank,
+        world_size=ddp_world_size)
 
     # Model
     model = GPTModel(GPTConfig(
@@ -267,22 +327,29 @@ def main():
     ))
     model.to(device)
     model = torch.compile(model)
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
 
-    # torch.set_float32_matmul_precision("high")        # in video
-    # torch.backends.cuda.matmul.fp32_precision = 'tf32'  # newer api
-    # torch.backends.cudnn.conv.fp32_precision = 'tf32'
-
-    # Batching
-    total_batch_size = 524288   # 2**19, ~0.5M
-    block_size = 1024
-    micro_batch = 8
-    assert total_batch_size % (block_size*micro_batch) == 0  # divisible into grad_accum
-    grad_accum = total_batch_size // (block_size*micro_batch)
-    print(f"{total_batch_size=}, {block_size=}, {micro_batch=}, {grad_accum=}")
-
-    # Data Loader
-    data_path = os.path.dirname(__file__)+'/../data/tinyshakespeare.txt'
-    data_loader = DataLoader(data_path, batch_size=micro_batch, block_size=block_size)
+    ################################ EQUIVALENCE ###############################
+    # - CUDA_VISIBLE_DEVICES=-1 python train_gpt2.py
+    # - python train_gpt2.py
+    # - torchrun --standalone --nproc_per_node=2 train_gpt2.py
+    # torch.set_printoptions(precision=10, sci_mode=True, linewidth=200)
+    # model_raw = model.module if ddp else model
+    # for r in range(ddp_world_size):
+    #     if ddp_local_rank == r:
+    #         print(f"--- [rank {ddp_local_rank}] ---", flush=True)
+    #         print("Init:")
+    #         print(model_raw.transformer.wte.weight[0, :10].detach().cpu())
+    #         print(model_raw.transformer.h[0].ln_1.weight[:10].detach().cpu())
+    #         print(model_raw.transformer.h[0].attn.c_attn.weight[0, :10].detach().cpu())
+    #         print(model_raw.transformer.h[0].mlp.c_proj.weight[0, :10].detach().cpu())
+    #         print(model_raw.transformer.ln_f.weight[:10].detach().cpu())
+    #         print(model_raw.lm_head.weight[0, :10].detach().cpu())
+    #         print(f"--- ----------------------- ---", flush=True)
+    #     if ddp:
+    #         torch.distributed.barrier()
+    ############################################################################
 
     # LR Scheduler
     max_lr = 6e-4
@@ -305,12 +372,14 @@ def main():
     ]
     num_decay = sum(p.numel() for p in decay_params)
     num_nodecay = sum(p.numel() for p in nodecay_params)
-    print(f"Decay {len(decay_params)} tensors with {num_decay} params")
-    print(f"Nodecay {len(nodecay_params)} tensors with {num_nodecay} params")
+    if ddp_master:
+        print(f"Decay {len(decay_params)} tensors with {num_decay} params")
+        print(f"Nodecay {len(nodecay_params)} tensors with {num_nodecay} params")
     # Check if fused adam
     fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
     use_fused = fused_available and 'cuda' in device
-    print(f"Using fused AdamW: {use_fused}")
+    if ddp_master:
+        print(f"Using fused AdamW: {use_fused}")
     optimizer = torch.optim.AdamW(
         optim_groups,
         lr=max_lr,
@@ -330,12 +399,21 @@ def main():
         for ii in range(grad_accum):
             x, y = data_loader.get_batch()
             x, y = x.to(device), y.to(device)
+            # autocast to bfloat16 hangs in backward() on CPU
             # https://docs.pytorch.org/tutorials/recipes/recipes/amp_recipe.html
-            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            autocast_ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == 'cuda' else nullcontext()
+            with autocast_ctx:
                 logits, loss = model(x, y)
             loss /= grad_accum
-            loss.backward()
             loss_accum += loss.detach()
+            # Sync only if DDP and last backward step
+            context = model.no_sync() if (ddp and ii < grad_accum - 1) else nullcontext()
+            with context:
+                loss.backward()
+        if ddp:
+            torch.distributed.all_reduce(loss_accum, op=torch.distributed.ReduceOp.AVG)
+            
+        # Gradient norm clip
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
         # Optimizer step
@@ -345,14 +423,40 @@ def main():
         optimizer.step()
 
         # Logs
-        torch.cuda.synchronize()
+        if device.startswith('cuda'):
+            torch.cuda.synchronize() # wait for the GPU to finish work
         dt = (time.time() - ts)
-        tps = (micro_batch * block_size * grad_accum) / dt
+        tps = (micro_batch * block_size * grad_accum* ddp_world_size) / dt
         if i != 0:  # skip compile
             dt_list.append(dt), tps_list.append(tps)
-        print(f"{i:4d}:, L={loss_accum.item():.6f}, lr={lr:.4e} norm={norm:.4f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
+        if ddp_master:
+            print(f"{i:4d}:, L={loss_accum.item():.6f}, lr={lr:.4e} norm={norm:.4f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
     
-    print(f"Avg dt: {sum(dt_list)/len(dt_list)*1e3:.2f}  Agv tps: {sum(tps_list)/len(tps_list):.2f}")
+    if ddp_master and dt_list:
+        print(f"Avg dt: {sum(dt_list)/len(dt_list)*1e3:.2f}  Agv tps: {sum(tps_list)/len(tps_list):.2f}")
+
+
+    ################################ EQUIVALENCE ###############################
+    # - CUDA_VISIBLE_DEVICES=-1 python train_gpt2.py          <- different
+    # - CUBLAS_WORKSPACE_CONFIG=:4096:8 python train_gpt2.py
+    # - CUBLAS_WORKSPACE_CONFIG=:4096:8 torchrun --standalone --nproc_per_node=2 train_gpt2.py
+    # EQUIVALENCE CHECK: WEIGHT INIT
+    # torch.set_printoptions(precision=10, sci_mode=True, linewidth=200)
+    # model_raw = model.module if ddp else model
+    # for r in range(ddp_world_size):
+    #     if ddp_local_rank == r:
+    #         print(f"--- [rank {ddp_local_rank}] ---", flush=True)
+    #         print("After:")
+    #         print(model_raw.transformer.wte.weight[0, :10].detach().cpu())
+    #         print(model_raw.transformer.h[0].ln_1.weight[:10].detach().cpu())
+    #         print(model_raw.transformer.h[0].attn.c_attn.weight[0, :10].detach().cpu())
+    #         print(model_raw.transformer.h[0].mlp.c_proj.weight[0, :10].detach().cpu())
+    #         print(model_raw.transformer.ln_f.weight[:10].detach().cpu())
+    #         print(model_raw.lm_head.weight[0, :10].detach().cpu())
+    #         print(f"--- ----------------------- ---", flush=True)
+    #     if ddp:
+    #         torch.distributed.barrier()
+    ############################################################################
 
     # Avg dt: 534.84  Agv tps: 15364.54 - base fp32
     # Avg dt: 405.77  Agv tps: 20282.09 - use tf32
@@ -362,6 +466,16 @@ def main():
     # Avg dt: 136.42  Agv tps: 60050.99 - switch vocab size to 50304
     # Avg dt: 134.80  Agv tps: 60773.48 - fused AdamW
 
+    # total_batch_size=524288, block_size=1024, micro_batch=16, ddp_world_size=1, grad_accum=32
+    # 9:, L=7.341308, lr=6.0000e-04 norm=1.8631, dt=8139.71ms, tps=64411.14
+
+    # total_batch_size=524288, block_size=1024, micro_batch=16, ddp_world_size=1, grad_accum=32
+    # 9:, L=7.331692, lr=6.0000e-04 norm=1.9200, dt=7618.34ms, tps=68819.22
+
+    # total_batch_size=524288, block_size=1024, micro_batch=16, ddp_world_size=2, grad_accum=16
+    # 8:, L=7.696642, lr=5.4000e-04 norm=2.3113, dt=4870.42ms, tps=107647.40
+    if ddp:
+        torch.distributed.destroy_process_group()
     print("Bye")
 
 

@@ -1,4 +1,5 @@
 import os
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,12 +52,10 @@ class DataLoader():
 
         self.pos += self.batch_size * self.world_size
         if self.pos + (self.batch_size * self.world_size) > self.dataset_size:
-            self.pos = 0
+            self.pos = self.batch_size * self.local_rank
 
         return x, y
 
-
-from contextlib import nullcontext
 
 def main():
     # DDP Init
@@ -85,9 +84,10 @@ def main():
 
     # Batching is affected
     dataset_size = 1024
-    total_batch_size = 64
+    total_batch_size = 64  # elements or 'tokens', example has 2 'tokens' x1,x2
     micro_batch = 8     # micro batch
     block_size = 2     # just (x1,x2) pair per example
+    assert total_batch_size % (micro_batch*block_size*ddp_world_size) == 0
     grad_accum = total_batch_size // (micro_batch*block_size*ddp_world_size)
     print(f"{total_batch_size=}, {block_size=}, {micro_batch=}, {grad_accum=}")
 
@@ -135,13 +135,13 @@ def main():
             x, y = data_loader.get_batch()
             x, y = x.to(device), y.to(device)
             
+            logits, loss = model(x, y)
+            loss = loss / grad_accum
+            loss_accum += loss.detach()
             # Sync only if DDP and last backward step
             context = model.no_sync() if (ddp and ii < grad_accum - 1) else nullcontext()
             with context:
-                logits, loss = model(x, y)
-                loss = loss / grad_accum
                 loss.backward()
-            loss_accum += loss.detach()
             
         if ddp:
             torch.distributed.all_reduce(loss_accum, op=torch.distributed.ReduceOp.AVG)
@@ -154,7 +154,7 @@ def main():
         tok_processed = micro_batch * block_size * grad_accum * ddp_world_size
         if ddp_master:
             if i % 1000 == 0 or i == max_steps-1:
-                print(f"{i:4d}:, L={loss_accum.item():.6f}, tok={tok_processed}")
+                print(f"{i:4d}:, L={loss_accum.item():.6f}, {loss.item()} tok={tok_processed}")
 
     print('---')
     #print(data_loader.X[:5])

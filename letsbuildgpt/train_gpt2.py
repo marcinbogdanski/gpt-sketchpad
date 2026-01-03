@@ -428,8 +428,42 @@ def main():
         fused=use_fused,
     )
 
-    model.train()
+    # Eval Params
+    eval_loss_every = 250  # steps
+    eval_accum_steps = 20   # steps
+
     for i in range(max_steps):
+        
+        ########################################
+        # Evaluate
+        if (i % eval_loss_every) == 0 or (i == max_steps-1):
+            model.eval()
+            val_loader.reset()
+            ts = time.time()
+            loss_val_accum = 0.0    
+            with torch.no_grad():
+                for ii in range(eval_accum_steps):
+                    x, y = val_loader.get_batch()
+                    x, y = x.to(device), y.to(device)
+                    autocast_ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == 'cuda' else nullcontext()
+                    with autocast_ctx:
+                        logits, loss = model(x, y)
+                    loss = loss / eval_accum_steps
+                    loss_val_accum += loss.detach()
+            if ddp:
+                torch.distributed.all_reduce(loss_val_accum, op=torch.distributed.ReduceOp.AVG)
+                    
+            # Logs
+            if device.startswith('cuda'):
+                torch.cuda.synchronize() # wait for the GPU to finish work
+            dt = (time.time() - ts)
+            tps = (micro_batch * block_size * eval_accum_steps * ddp_world_size) / dt
+            if ddp_master:
+                print(f"{i:4d}:, L={loss_val_accum.item():.6f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
+
+        ########################################
+        # Training Step
+        model.train()
         ts = time.time()
 
         # Calc gradient

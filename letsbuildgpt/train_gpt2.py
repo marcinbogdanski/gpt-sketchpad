@@ -3,6 +3,7 @@ import math
 import time
 import inspect
 from contextlib import nullcontext
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -203,7 +204,7 @@ def generate(model, idx, max_new_tokens, top_k=50):
             idx = torch.cat((idx, xcol), dim=1)                # B,T+1  append
     return idx
 
-class DataLoader:
+class DataLoaderShakespeare:
     def __init__(self, data_path, batch_size, block_size, proc_rank, world_size):
         self.data_path = data_path
         self.batch_size = batch_size
@@ -228,6 +229,47 @@ class DataLoader:
             self.pos = self.batch_size * self.block_size * self.proc_rank
 
         return x, y
+
+class DataLoader:
+    def __init__(self, data_path, batch_size, block_size, proc_rank, world_size, split):
+        self.data_path = data_path
+        self.batch_size = batch_size
+        self.block_size = block_size
+        self.proc_rank = proc_rank
+        self.world_size = world_size
+        assert split in ['train', 'val']
+        self.split = split
+
+        # Read shard file names
+        self.shards = os.listdir(data_path)
+        self.shards = sorted([s for s in self.shards if self.split in s])
+        self.reset()
+
+    def load_shard(self, shard_idx):
+        filepath = os.path.join(self.data_path, self.shards[shard_idx])
+        tokens_np = np.load(filepath).astype(np.int32)
+        return torch.tensor(tokens_np, dtype=torch.long)
+
+    def reset(self):
+        self.current_shard = 0
+        self.tokens = self.load_shard(self.current_shard)
+        self.pos = self.batch_size * self.block_size * self.proc_rank
+
+    def get_batch(self):
+        buff = self.tokens[self.pos:self.pos+self.batch_size*self.block_size+1]
+        x = buff[:-1].view(self.batch_size, self.block_size)
+        y = buff[1:].view(self.batch_size, self.block_size)
+
+        self.pos += self.batch_size * self.block_size * self.world_size
+        if self.pos + self.batch_size * self.block_size * self.world_size + 1 > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = self.load_shard(self.current_shard)
+            self.pos = self.batch_size * self.block_size * self.proc_rank
+
+        return x, y
+
+
+
 
 class LRScheduler:
     def __init__(self, max_lr, min_lr, warmup_steps, max_steps):
@@ -275,7 +317,7 @@ def main():
     torch.backends.cudnn.conv.fp32_precision = 'tf32'
 
     # Reproducibility
-    # TODO: Model init relies on identical random seeds, will address later
+    # Model init relies on identical random seeds, will address later
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(42)
@@ -289,7 +331,7 @@ def main():
     ############################################################################
 
     # Batching
-    total_batch_size = 524288 // 2   # 2**19, ~0.5M
+    total_batch_size = 524288    # 2**19, ~0.5M
     micro_batch = 16             # what fits in GPU
     block_size = 1024
     assert total_batch_size % (block_size*micro_batch*ddp_world_size) == 0
@@ -298,12 +340,22 @@ def main():
         print(f"{total_batch_size=}, {block_size=}, {micro_batch=}, {ddp_world_size=}, {grad_accum=}")
 
     # Data Loader
-    data_loader = DataLoader(
-        data_path=os.path.dirname(__file__)+'/../data/tinyshakespeare.txt',
+    train_loader = DataLoader(
+        data_path=os.path.dirname(__file__)+'/../data/fineweb-edu-sample-10BT',
         batch_size=micro_batch,
         block_size=block_size,
         proc_rank=ddp_rank,
-        world_size=ddp_world_size)
+        world_size=ddp_world_size,
+        split='train',
+    )
+    val_loader = DataLoader(
+        data_path=os.path.dirname(__file__)+'/../data/fineweb-edu-sample-10BT',
+        batch_size=micro_batch,
+        block_size=block_size,
+        proc_rank=ddp_rank,
+        world_size=ddp_world_size,
+        split='val',
+    )
 
     # Model
     model = GPTModel(GPTConfig(
@@ -340,10 +392,10 @@ def main():
     ############################################################################
 
     # LR Scheduler
-    max_lr = 6e-4
+    max_lr = 6e-4              # params from GPT-3 paper, 124M model
     min_lr = max_lr * 0.1
-    warmup_steps = 10
-    max_steps = 50
+    warmup_steps = 715         # 375M tokens / 2**19 tok = 715 steps
+    max_steps = 19073          # 10B tokens / 2**19 tok = 19073 - 1 epoch
     lr_scheduler = LRScheduler(max_lr, min_lr, warmup_steps=warmup_steps, max_steps=max_steps)
 
     # Optimizer
@@ -376,7 +428,6 @@ def main():
         fused=use_fused,
     )
 
-    dt_list, tps_list = [], []
     model.train()
     for i in range(max_steps):
         ts = time.time()
@@ -385,7 +436,7 @@ def main():
         loss_accum = 0.0
         optimizer.zero_grad()
         for ii in range(grad_accum):
-            x, y = data_loader.get_batch()
+            x, y = train_loader.get_batch()
             x, y = x.to(device), y.to(device)
             # autocast to bfloat16 hangs in backward() on CPU
             # https://docs.pytorch.org/tutorials/recipes/recipes/amp_recipe.html
@@ -415,13 +466,12 @@ def main():
             torch.cuda.synchronize() # wait for the GPU to finish work
         dt = (time.time() - ts)
         tps = (micro_batch * block_size * grad_accum* ddp_world_size) / dt
-        if i != 0:  # skip compile
-            dt_list.append(dt), tps_list.append(tps)
         if ddp_master:
-            print(f"{i:4d}:, L={loss_accum.item():.6f}, lr={lr:.4e} norm={norm:.4f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
+            pct = (i+1) / max_steps * 100
+            cs = train_loader.current_shard
+            cp = train_loader.pos
+            print(f"{i:4d} ({pct:.2f}%) [{cs};{cp:,}]:, L={loss_accum.item():.6f}, lr={lr:.4e} norm={norm:.4f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
 
-    if ddp_master and dt_list:
-        print(f"Avg dt: {sum(dt_list)/len(dt_list)*1e3:.2f}  Agv tps: {sum(tps_list)/len(tps_list):.2f}")
 
 
     ################################ EQUIVALENCE ###############################

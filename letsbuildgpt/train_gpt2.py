@@ -64,13 +64,11 @@ class MLP(nn.Module):
         self.act = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4*config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1  # flag to scale proj into residual
-        # self.drop = nn.Dropout(config.dropout)
     
     def forward(self, x):
         x = self.c_fc(x)
         x = self.act(x)
         x = self.c_proj(x)
-        # x = self.drop(x)
         return x
 
 class Block(nn.Module):
@@ -231,16 +229,53 @@ class DataLoader:
         # - DDP, large batch spread across GPUs, no grad accum - boundry checked every full batch
         self.pos += self.batch_size * self.block_size * self.world_size
         if self.pos + self.batch_size * self.block_size * self.world_size + 1 > len(self.tokens):
-            # will need later to update DataLoader
-            # for r in range(self.world_size):
-            #     if self.proc_rank == r:
-            #         print(f"{self.proc_rank}: RESET POS at: {self.pos}", flush=True)
-            #     if self.world_size != 1:
-            #         torch.distributed.barrier()
-            # print(f"RESET ({self.proc_rank}): {self.pos}")
             self.pos = self.batch_size * self.block_size * self.proc_rank
 
         return x, y
+
+# [          page 0           |           page 1          ]
+# [   accum 0   |   accum 1   |   accum 0   |   accum 1   ]
+# [ dds0 | dds1 | dds0 | dds1 | dds0 | dds1 | dds0 | dds1 ]
+class DataLoaderPaged:
+    def __init__(self, data_path, batch_size, block_size, proc_rank, world_size, grad_accum):
+        self.data_path = data_path
+        self.batch_size = batch_size
+        self.block_size = block_size
+        self.proc_rank = proc_rank
+        self.world_size = world_size
+        self.grad_accum = grad_accum
+        self.page_idx = 0
+        self.accum_idx = 0
+        self.page_size = self.batch_size * self.block_size * self.world_size * self.grad_accum
+
+        with open(data_path, 'r') as f:
+            text = f.read()
+        tokenizer = tiktoken.get_encoding("gpt2")
+        tokens = tokenizer.encode(text)
+        self.tokens = torch.tensor(tokens)
+
+        self.last_batch = None  # Debug
+
+    def get_batch(self):
+        buff_start = \
+            self.page_idx * self.page_size + \
+            self.accum_idx * (self.batch_size * self.block_size * self.world_size) + \
+            self.proc_rank * (self.batch_size * self.block_size)
+        buff_end = buff_start + (self.batch_size * self.block_size)
+        buff = self.tokens[buff_start:buff_end+1]  # +1 to grab last target
+
+        x = buff[:-1].view(self.batch_size, self.block_size)
+        y = buff[1:].view(self.batch_size, self.block_size)
+        # TODO: needs per-epoch shuffling deterministic across DDP
+        self.accum_idx += 1
+        if self.accum_idx >= self.grad_accum:
+            self.accum_idx = 0
+            self.page_idx += 1
+            if self.page_idx * self.page_size + self.page_size + 1  > len(self.tokens):
+                self.page_idx = 0
+
+        return x, y
+
 
 class LRScheduler:
     def __init__(self, max_lr, min_lr, warmup_steps, max_steps):
@@ -295,13 +330,14 @@ def main():
         torch.cuda.manual_seed_all(42)
     
     ################################ EQUIVALENCE ###############################
+    # Dissable TORCH.COMPILE for reproducibility non-DDP/DDP
     # torch.backends.cudnn.deterministic = True
     # torch.backends.cudnn.benchmark = False
     # torch.use_deterministic_algorithms(True)
     ############################################################################
 
     # Batching
-    total_batch_size = 524288   # 2**19, ~0.5M
+    total_batch_size = 524288 // 2   # 2**19, ~0.5M
     micro_batch = 16             # what fits in GPU
     block_size = 1024
     assert total_batch_size % (block_size*micro_batch*ddp_world_size) == 0
@@ -310,12 +346,13 @@ def main():
         print(f"{total_batch_size=}, {block_size=}, {micro_batch=}, {ddp_world_size=}, {grad_accum=}")
 
     # Data Loader
-    data_loader = DataLoader(
+    data_loader = DataLoaderPaged(
         data_path=os.path.dirname(__file__)+'/../data/tinyshakespeare.txt',
         batch_size=micro_batch,
         block_size=block_size,
         proc_rank=ddp_rank,
-        world_size=ddp_world_size)
+        world_size=ddp_world_size,
+        grad_accum=grad_accum)
 
     # Model
     model = GPTModel(GPTConfig(
@@ -431,7 +468,7 @@ def main():
             dt_list.append(dt), tps_list.append(tps)
         if ddp_master:
             print(f"{i:4d}:, L={loss_accum.item():.6f}, lr={lr:.4e} norm={norm:.4f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
-    
+
     if ddp_master and dt_list:
         print(f"Avg dt: {sum(dt_list)/len(dt_list)*1e3:.2f}  Agv tps: {sum(tps_list)/len(tps_list):.2f}")
 

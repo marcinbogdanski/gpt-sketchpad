@@ -223,59 +223,11 @@ class DataLoader:
         x = buff[:-1].view(self.batch_size, self.block_size)
         y = buff[1:].view(self.batch_size, self.block_size)
 
-        # TODO: needs per-epoch shuffling deterministic across DDP
-        # TODO: Position reset logic is subject to slightly different behavior between:
-        # - no DDP, large batch with gradient accumlation - boundry checked every mini_batch
-        # - DDP, large batch spread across GPUs, no grad accum - boundry checked every full batch
         self.pos += self.batch_size * self.block_size * self.world_size
         if self.pos + self.batch_size * self.block_size * self.world_size + 1 > len(self.tokens):
             self.pos = self.batch_size * self.block_size * self.proc_rank
 
         return x, y
-
-# [          page 0           |           page 1          ]
-# [   accum 0   |   accum 1   |   accum 0   |   accum 1   ]
-# [ dds0 | dds1 | dds0 | dds1 | dds0 | dds1 | dds0 | dds1 ]
-class DataLoaderPaged:
-    def __init__(self, data_path, batch_size, block_size, proc_rank, world_size, grad_accum):
-        self.data_path = data_path
-        self.batch_size = batch_size
-        self.block_size = block_size
-        self.proc_rank = proc_rank
-        self.world_size = world_size
-        self.grad_accum = grad_accum
-        self.page_idx = 0
-        self.accum_idx = 0
-        self.page_size = self.batch_size * self.block_size * self.world_size * self.grad_accum
-
-        with open(data_path, 'r') as f:
-            text = f.read()
-        tokenizer = tiktoken.get_encoding("gpt2")
-        tokens = tokenizer.encode(text)
-        self.tokens = torch.tensor(tokens)
-
-        self.last_batch = None  # Debug
-
-    def get_batch(self):
-        buff_start = \
-            self.page_idx * self.page_size + \
-            self.accum_idx * (self.batch_size * self.block_size * self.world_size) + \
-            self.proc_rank * (self.batch_size * self.block_size)
-        buff_end = buff_start + (self.batch_size * self.block_size)
-        buff = self.tokens[buff_start:buff_end+1]  # +1 to grab last target
-
-        x = buff[:-1].view(self.batch_size, self.block_size)
-        y = buff[1:].view(self.batch_size, self.block_size)
-        # TODO: needs per-epoch shuffling deterministic across DDP
-        self.accum_idx += 1
-        if self.accum_idx >= self.grad_accum:
-            self.accum_idx = 0
-            self.page_idx += 1
-            if self.page_idx * self.page_size + self.page_size + 1  > len(self.tokens):
-                self.page_idx = 0
-
-        return x, y
-
 
 class LRScheduler:
     def __init__(self, max_lr, min_lr, warmup_steps, max_steps):
@@ -346,13 +298,12 @@ def main():
         print(f"{total_batch_size=}, {block_size=}, {micro_batch=}, {ddp_world_size=}, {grad_accum=}")
 
     # Data Loader
-    data_loader = DataLoaderPaged(
+    data_loader = DataLoader(
         data_path=os.path.dirname(__file__)+'/../data/tinyshakespeare.txt',
         batch_size=micro_batch,
         block_size=block_size,
         proc_rank=ddp_rank,
-        world_size=ddp_world_size,
-        grad_accum=grad_accum)
+        world_size=ddp_world_size)
 
     # Model
     model = GPTModel(GPTConfig(

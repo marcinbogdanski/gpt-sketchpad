@@ -183,25 +183,31 @@ class GPTModel(nn.Module):
 
         return model
 
-def generate(model, idx, max_new_tokens, top_k=50):
+def generate(model, idx, max_new_tokens, top_k=50, sample_rng=None):
     """Generate max_tokens starting from idx[B,T]"""
     assert isinstance(idx, torch.Tensor)
     assert idx.dtype == torch.long
     assert len(idx.shape) == 2  # B,T
     assert isinstance(max_new_tokens, int)
     
+    is_training = model.training
     model.eval()
+
     block_size = model.config.block_size
     with torch.no_grad():
         for _ in range(max_new_tokens):
             idx_tail = idx[:, -block_size:]    # B,T  sliding window
-            logits, _ = model(idx_tail)         # B,T,C <- B,T
+            context = torch.autocast(device_type=idx.device.type, dtype=torch.bfloat16) if idx.device.type == 'cuda' else nullcontext()
+            with context:
+                logits, _ = model(idx_tail)         # B,T,C <- B,T
             logits = logits[:, -1, :]          # B,C <- B,T,C  discard all but last
             probs = F.softmax(logits, dim=-1)  # B,C
             topk_probs, topk_indices = torch.topk(probs, k=top_k, dim=-1)  # B,k
-            ix = torch.multinomial(topk_probs, num_samples=1)  # B,1
+            ix = torch.multinomial(topk_probs, num_samples=1, generator=sample_rng)  # B,1
             xcol = torch.gather(topk_indices, -1, ix)          # B,1
             idx = torch.cat((idx, xcol), dim=1)                # B,T+1  append
+    
+    model.train(is_training)
     return idx
 
 class DataLoaderShakespeare:
@@ -309,12 +315,17 @@ def main():
         device_type = device
     print(f"{ddp=} {ddp_rank=}, {ddp_local_rank=}, {ddp_world_size=}, {ddp_master=}, {device=}")
 
-    # Note = 'tf32' is the correct way as per torch 2.9 docs
+    # Option 1 - old API
     # torch.set_float32_matmul_precision("high")        # in video, causes deprecated warning
-    assert torch.backends.cuda.matmul.fp32_precision    # check they exist
-    assert torch.backends.cudnn.conv.fp32_precision
-    torch.backends.cuda.matmul.fp32_precision = 'tf32'  # newer api
-    torch.backends.cudnn.conv.fp32_precision = 'tf32'
+    # Option 2 - new API
+    # Note = 'tf32' is the correct way as per torch 2.9 docs
+    # assert torch.backends.cuda.matmul.fp32_precision    # check they exist
+    # assert torch.backends.cudnn.conv.fp32_precision
+    # torch.backends.cuda.matmul.fp32_precision = 'tf32'  # newer api
+    # torch.backends.cudnn.conv.fp32_precision = 'tf32'
+    # Option 3 - compatible with generation
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     # Reproducibility
     # Model init relies on identical random seeds, will address later
@@ -432,10 +443,17 @@ def main():
     eval_loss_every = 250  # steps
     eval_accum_steps = 20   # steps
 
+    # Generate Params
+    gen_samples_every = 250  # steps
+    tok = tiktoken.get_encoding("gpt2")
+    prompt = "Hello, I'm a language model,"  # 8 tokens
+    max_new_tokens = 24
+    num_generate = 4
+
     for i in range(max_steps):
         
         ########################################
-        # Evaluate
+        # Evaluate validation loss
         if (i % eval_loss_every) == 0 or (i == max_steps-1):
             model.eval()
             val_loader.reset()
@@ -459,10 +477,31 @@ def main():
             dt = (time.time() - ts)
             tps = (micro_batch * block_size * eval_accum_steps * ddp_world_size) / dt
             if ddp_master:
-                print(f"{i:4d}:, L={loss_val_accum.item():.6f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
+                print(f"Eval at {i:4d}:, L={loss_val_accum.item():.6f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
 
         ########################################
-        # Training Step
+        # Generate samples
+        if (i > 0 and (i % gen_samples_every) == 0) or (i == max_steps-1):
+            model.eval()
+
+            sample_rng = torch.Generator(device=device)
+            sample_rng.manual_seed(42 + ddp_rank)
+
+            tokens = tok.encode(prompt)
+            idx = torch.tensor(tokens, dtype=torch.long, device=device)
+            idx = idx.unsqueeze(0).repeat(num_generate, 1)  # B,T
+            idx = generate(model, idx, max_new_tokens, top_k=50, sample_rng=sample_rng) # B,T
+
+            for r in range(ddp_world_size):
+                if ddp_local_rank == r:
+                    for b in range(idx.shape[0]):
+                        gen_text = tok.decode(idx[b].tolist())
+                        print(f"  {r}:{b} > {gen_text}", flush=True)
+                if ddp:
+                    torch.distributed.barrier()
+
+        ########################################
+        # Training step
         model.train()
         ts = time.time()
 

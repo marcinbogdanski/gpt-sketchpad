@@ -3,6 +3,7 @@ import math
 import time
 import json
 import inspect
+from dataclasses import dataclass
 from contextlib import nullcontext
 import numpy as np
 import torch
@@ -11,15 +12,13 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 import tiktoken
 
+@dataclass
 class GPTConfig:
-    def __init__(self, block_size, vocab_size, n_layer, n_head, n_embd, dropout=0.0):
-        self.block_size = block_size
-        self.vocab_size = vocab_size
-        self.n_layer = n_layer
-        self.n_head = n_head
-        self.n_embd = n_embd
-        self.dropout = dropout  # 0.0, Karpathy doesn't use dropout in the video
-
+    block_size: int
+    vocab_size: int
+    n_layer: int
+    n_head: int
+    n_embd: int
 
 
 class CausalSelfAttentionMarcin(nn.Module):
@@ -237,6 +236,11 @@ class DataLoaderShakespeare:
 
         return x, y
 
+@dataclass
+class DataLoaderState:
+    current_shard: int
+    pos: int
+
 class DataLoader:
     def __init__(self, data_path, batch_size, block_size, proc_rank, world_size, split):
         self.data_path = data_path
@@ -251,6 +255,12 @@ class DataLoader:
         self.shards = os.listdir(data_path)
         self.shards = sorted([s for s in self.shards if self.split in s])
         self.reset()
+
+    def get_state(self):
+        return DataLoaderState(
+            current_shard=self.current_shard,
+            pos=self.pos,
+        )
 
     def load_shard(self, shard_idx):
         filepath = os.path.join(self.data_path, self.shards[shard_idx])
@@ -461,6 +471,9 @@ def main():
     # Eval Params
     eval_loss_every = 250  # steps
     eval_accum_steps = 20   # steps
+    # Checkpoint
+    checkpoint_every = 5000  # steps
+    assert checkpoint_every % eval_loss_every == 0
 
     # Generate Params
     gen_samples_every = 250  # steps
@@ -514,6 +527,20 @@ def main():
                 print(f"Eval at {i:4d}:, L={loss_val_accum.item():.6f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
                 with open(logfile, 'a') as f:
                     f.write(f"val,{i},{total_tok},{loss_val_accum.item():.6f}\n")
+                if (i > 0 and (i % checkpoint_every) == 0) or (i == max_steps-1):
+                    model_raw = model.module if ddp else model
+                    ckpt_path = f"ckpt_step_{i:06d}.pt"
+                    checkpoint = {
+                        'model_state_dict': model_raw.state_dict(),
+                        'model_config': model_raw.config,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'train_loader_state': train_loader.get_state(),
+                        'val_loader_state': val_loader.get_state(),
+                        'step': i,
+                        'total_tok': total_tok,
+                        'val_loss': loss_val_accum.item(),
+                    }
+                    torch.save(checkpoint, ckpt_path)
 
         ########################################
         # HellaSwag Evaluation

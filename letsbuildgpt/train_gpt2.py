@@ -478,6 +478,12 @@ def main():
         lines = f.readlines()
     hellaswag_examples = [json.loads(line) for line in lines]
 
+    # Logging
+    logfile = "log.txt"
+    with open(logfile, 'w') as f:
+        pass  # clear logfile
+
+    total_tok = 0
     for i in range(max_steps):
         
         ########################################
@@ -506,6 +512,8 @@ def main():
             tps = (micro_batch * block_size * eval_accum_steps * ddp_world_size) / dt
             if ddp_master:
                 print(f"Eval at {i:4d}:, L={loss_val_accum.item():.6f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
+                with open(logfile, 'a') as f:
+                    f.write(f"val,{i},{total_tok},{loss_val_accum.item():.6f}\n")
 
         ########################################
         # HellaSwag Evaluation
@@ -549,6 +557,8 @@ def main():
             acc_norm = num_correct / num_total
             if ddp_master:
                 print(f"HellaSwag acc={acc_norm:.4f} correct={num_correct} total={num_total}")
+                with open(logfile, 'a') as f:
+                    f.write(f"hella,{i},{total_tok},{acc_norm:.6f}\n")
 
 
         ########################################
@@ -569,6 +579,9 @@ def main():
                     for b in range(idx.shape[0]):
                         gen_text = tok.decode(idx[b].tolist())
                         print(f"  {r}:{b} > {gen_text}", flush=True)
+                        if ddp_master:
+                            with open(logfile, 'a') as f:
+                                f.write(f"gen,{i},{total_tok},{r},{b},{gen_text}\n")
                 if ddp:
                     torch.distributed.barrier()
 
@@ -610,13 +623,17 @@ def main():
         if device.startswith('cuda'):
             torch.cuda.synchronize() # wait for the GPU to finish work
         dt = (time.time() - ts)
-        tps = (micro_batch * block_size * grad_accum* ddp_world_size) / dt
+        ntok = (micro_batch * block_size * grad_accum* ddp_world_size)
+        total_tok += ntok
+        tps = ntok / dt
         if ddp_master:
             pct = (i+1) / max_steps * 100
             cs = train_loader.current_shard
             cp = train_loader.pos
             print(f"{i:4d} ({pct:.2f}%) [{cs};{cp:,}]:, L={loss_accum.item():.6f}, lr={lr:.4e} norm={norm:.4f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
-
+            with open(logfile, 'a') as f:
+                f.write(f"train,{i},{total_tok},{loss_accum.item():.6f},{lr:.6e},{norm:.6f},{dt*1e3:.2f},{tps:.2f}\n")
+        
 
 
     ################################ EQUIVALENCE ###############################

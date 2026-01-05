@@ -1,6 +1,7 @@
 import os
 import math
 import time
+import json
 import inspect
 from contextlib import nullcontext
 import numpy as np
@@ -275,6 +276,22 @@ class DataLoader:
         return x, y
 
 
+class HellaSwagRenderer:
+    def __init__(self):
+        self.tok = tiktoken.get_encoding("gpt2")
+    
+    def render_example(self, example):
+        ctx, ends, label = example["ctx"], example["endings"], example["label"]
+        ctx_ids = self.tok.encode(ctx)
+        ending_ids = [self.tok.encode(" " + ending) for ending in ends]  # " " because gpt2 tokenizer
+        result_length = max(len(eids) for eids in ending_ids) + len(ctx_ids)
+        tokens = torch.zeros((len(ends), result_length), dtype=torch.long)
+        mask = torch.zeros((len(ends), result_length), dtype=torch.long)
+        for i, eids in enumerate(ending_ids):
+            tokens[i, :len(ctx_ids)] = torch.tensor(ctx_ids, dtype=torch.long)
+            tokens[i, len(ctx_ids) : len(ctx_ids)+len(eids)] = torch.tensor(eids, dtype=torch.long)
+            mask[i, len(ctx_ids) : len(ctx_ids)+len(eids)] = 1
+        return tokens, mask, label
 
 
 class LRScheduler:
@@ -315,6 +332,7 @@ def main():
         device_type = device
     print(f"{ddp=} {ddp_rank=}, {ddp_local_rank=}, {ddp_world_size=}, {ddp_master=}, {device=}")
 
+    # NOTE: Only affects perforamnce if autocast is *not* used
     # Option 1 - old API
     # torch.set_float32_matmul_precision("high")        # in video, causes deprecated warning
     # Option 2 - new API
@@ -369,6 +387,7 @@ def main():
     )
 
     # Model
+    # NOTE: because vocab_size is expanded model may in theory generate invalid tokens
     model = GPTModel(GPTConfig(
         block_size=1024,     # max context length, max len feed into the model,
         vocab_size=50304,    # 50304 is 'nicer', original was 50257
@@ -450,6 +469,15 @@ def main():
     max_new_tokens = 24
     num_generate = 4
 
+    # HellaSwag Stuff
+    # Read all lines from the validation set
+    hellaswag_every = 250  # steps
+    hellaswag_renderer = HellaSwagRenderer()
+    hellaswag_fp = os.path.dirname(__file__) + "/../data/hellaswag/hellaswag_val.jsonl"
+    with open(hellaswag_fp, "r") as f:
+        lines = f.readlines()
+    hellaswag_examples = [json.loads(line) for line in lines]
+
     for i in range(max_steps):
         
         ########################################
@@ -465,7 +493,7 @@ def main():
                     x, y = x.to(device), y.to(device)
                     autocast_ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == 'cuda' else nullcontext()
                     with autocast_ctx:
-                        logits, loss = model(x, y)
+                        _, loss = model(x, y)
                     loss = loss / eval_accum_steps
                     loss_val_accum += loss.detach()
             if ddp:
@@ -478,6 +506,50 @@ def main():
             tps = (micro_batch * block_size * eval_accum_steps * ddp_world_size) / dt
             if ddp_master:
                 print(f"Eval at {i:4d}:, L={loss_val_accum.item():.6f}, dt={dt*1e3:.2f}ms, tps={tps:.2f}")
+
+        ########################################
+        # HellaSwag Evaluation
+        if (i % hellaswag_every) == 0 or (i == max_steps-1):
+            model.eval()
+            num_total = 0
+            num_correct = 0
+            for j in range(len(hellaswag_examples)):
+                if j % ddp_world_size != ddp_rank:
+                    continue  # only do i-th example
+                example = hellaswag_examples[j]
+                tokens, mask, label = hellaswag_renderer.render_example(example)
+                tokens = tokens.to(device)
+                mask = mask.to(device)
+                with torch.no_grad():
+                    autocast_ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == 'cuda' else nullcontext()
+                    with autocast_ctx:
+                        logits, _ = model(tokens)
+                    logits_shifted = logits[:, :-1, :].contiguous()
+                    tokens_shifted = tokens[:, 1:].contiguous()
+                    mask_shifted = mask[:, 1:].contiguous()
+                    B, T_1, V = logits_shifted.shape
+                    losses_shifted = F.cross_entropy(
+                        logits_shifted.view(B*T_1, V),
+                        tokens_shifted.view(B*T_1),
+                        reduction='none'
+                    ).view(B, T_1)
+                    losses_shifted_masked = losses_shifted * mask_shifted
+                    losses_avg = losses_shifted_masked.sum(dim=1) / mask_shifted.sum(dim=1)
+                    model_label = torch.argmin(losses_avg).item()
+                    num_total += 1
+                    if model_label == label:
+                        num_correct += 1
+            if ddp:
+                num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+                num_correct = torch.tensor(num_correct, dtype=torch.long, device=device)
+                torch.distributed.all_reduce(num_total, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(num_correct, op=torch.distributed.ReduceOp.SUM)
+                num_total = num_total.item()
+                num_correct = num_correct.item()
+            acc_norm = num_correct / num_total
+            if ddp_master:
+                print(f"HellaSwag acc={acc_norm:.4f} correct={num_correct} total={num_total}")
+
 
         ########################################
         # Generate samples
@@ -515,7 +587,7 @@ def main():
             # https://docs.pytorch.org/tutorials/recipes/recipes/amp_recipe.html
             autocast_ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == 'cuda' else nullcontext()
             with autocast_ctx:
-                logits, loss = model(x, y)
+                _, loss = model(x, y)
             loss /= grad_accum
             loss_accum += loss.detach()
             # Sync only if DDP and last backward step

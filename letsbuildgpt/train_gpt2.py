@@ -166,11 +166,16 @@ class GPTModel(nn.Module):
 
         # Load weights from HF model
         our_sd = model.state_dict()
-        our_keys = set(k for k in our_sd.keys() if not k.endswith('.attn.bias'))
+        our_keys = set(our_sd.keys())
+        our_keys = set(k for k in our_keys if not k.endswith('.attn.masked_bias'))
+        our_keys = set(k for k in our_keys if not k.endswith('.attn.bias'))
         hf_sd = model_hf.state_dict()
         hf_keys = set(hf_sd.keys())
+        hf_keys = set(k for k in hf_keys if not k.endswith('.attn.masked_bias'))
+        hf_keys = set(k for k in hf_keys if not k.endswith('.attn.bias'))
         assert our_keys == hf_keys
-        for key, hf_val in hf_sd.items():
+        for key in hf_keys:
+            hf_val = hf_sd[key]
             hf_shape = hf_val.shape
             our_shape = our_sd[key].shape
             transpose = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']

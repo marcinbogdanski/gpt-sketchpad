@@ -10,6 +10,10 @@ dependencies = [
   "torch==2.9.0",
   "matplotlib==3.10.7",
   "graphviz==0.21",
+  "transformers==4.57.3",
+  "ipywidgets==8.1.8",
+  "tiktoken==0.12.0",
+  "datasets==4.4.2",
 ]
 
 # Don't allow non-wheel installs (no copile from source)
